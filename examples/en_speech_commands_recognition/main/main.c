@@ -88,6 +88,9 @@ static const char *TAG = "VOICE_ASSISTANT";
 #define WS2812_T1H_NS   (900)
 #define WS2812_T1L_NS   (350)
 
+
+// Add these globals at the top
+#define STREAM_BUFFER_SIZE (8192)
 // ======================== Animation Types ========================
 typedef enum {
   WAKEUP = 0,
@@ -120,6 +123,58 @@ static esp_afe_sr_iface_t *afe_handle = NULL;
 static volatile int task_flag = 0;
 static srmodel_list_t *models = NULL;
 static bool use_wake_word = false;  // Will be set based on model availability
+
+static volatile bool pause_wake_word = false;
+// Add this with other volatile flags
+static volatile bool interrupt_playback = false;
+
+static uint8_t *stream_buffer = NULL;
+static volatile size_t buffer_write_pos = 0;
+static volatile size_t buffer_read_pos = 0;
+static volatile size_t buffer_data_size = 0;
+static volatile bool stream_complete = false;
+static SemaphoreHandle_t buffer_mutex = NULL;
+
+static size_t get_buffered_data_size(void) {
+    size_t size;
+    xSemaphoreTake(buffer_mutex, portMAX_DELAY);
+    size = buffer_data_size;
+    xSemaphoreGive(buffer_mutex);
+    return size;
+}
+
+static size_t stream_buffer_write(const uint8_t *data, size_t len) {
+    xSemaphoreTake(buffer_mutex, portMAX_DELAY);
+    
+    size_t space_available = STREAM_BUFFER_SIZE - buffer_data_size;
+    size_t to_write = (len < space_available) ? len : space_available;
+    
+    for (size_t i = 0; i < to_write; i++) {
+        stream_buffer[buffer_write_pos] = data[i];
+        buffer_write_pos = (buffer_write_pos + 1) % STREAM_BUFFER_SIZE;
+    }
+    
+    buffer_data_size += to_write;
+    xSemaphoreGive(buffer_mutex);
+    
+    return to_write;
+}
+
+static size_t stream_buffer_read(uint8_t *data, size_t len) {
+    xSemaphoreTake(buffer_mutex, portMAX_DELAY);
+    
+    size_t to_read = (len < buffer_data_size) ? len : buffer_data_size;
+    
+    for (size_t i = 0; i < to_read; i++) {
+        data[i] = stream_buffer[buffer_read_pos];
+        buffer_read_pos = (buffer_read_pos + 1) % STREAM_BUFFER_SIZE;
+    }
+    
+    buffer_data_size -= to_read;
+    xSemaphoreGive(buffer_mutex);
+    
+    return to_read;
+}
 
 // Display
 static u8g2_t u8g2;
@@ -549,9 +604,10 @@ int calculate_audio_level(int16_t *buffer, int samples) {
 }
 
 // ======================== HTTP Response Handler ========================
+// Modified HTTP event handler for streaming
 esp_err_t http_event_handler(esp_http_client_event_t *evt) {
-    static FILE *response_file = NULL;
     static char emotion_buffer[64] = {0};
+    static bool started_playback = false;
     
     switch(evt->event_id) {
         case HTTP_EVENT_ON_HEADER:
@@ -564,34 +620,47 @@ esp_err_t http_event_handler(esp_http_client_event_t *evt) {
             break;
             
         case HTTP_EVENT_ON_DATA:
-            if (!response_file) {
-                response_file = fopen("/spiffs/response.mp3", "wb");
-                if (!response_file) {
-                    ESP_LOGE(TAG, "Failed to open file for writing");
-                    return ESP_FAIL;
+            if (evt->data_len > 0) {
+                // Write data to circular buffer
+                size_t written = 0;
+                while (written < evt->data_len) {
+                    size_t chunk = stream_buffer_write(
+                        (uint8_t*)evt->data + written, 
+                        evt->data_len - written
+                    );
+                    
+                    if (chunk == 0) {
+                        // Buffer full, wait a bit
+                        vTaskDelay(10 / portTICK_PERIOD_MS);
+                    } else {
+                        written += chunk;
+                    }
                 }
-            }
-            if (response_file && evt->data_len > 0) {
-                fwrite(evt->data, 1, evt->data_len, response_file);
+                
+                // Start playback once we have 2KB buffered
+                if (!started_playback && get_buffered_data_size() >= 2048) {
+                    started_playback = true;
+                    audio_response_ready = true;
+                    ESP_LOGI(TAG, "🎵 Starting streaming playback...");
+                }
             }
             break;
             
         case HTTP_EVENT_ON_FINISH:
-            if (response_file) {
-                fclose(response_file);
-                response_file = NULL;
+            stream_complete = true;
+            if (!started_playback) {
+                // Small file, start playback now
                 audio_response_ready = true;
-                ESP_LOGI(TAG, "✅ Audio response saved to SPIFFS");
             }
+            ESP_LOGI(TAG, "✅ Stream download complete");
+            started_playback = false;
             memset(emotion_buffer, 0, sizeof(emotion_buffer));
             break;
             
         case HTTP_EVENT_ERROR:
         case HTTP_EVENT_DISCONNECTED:
-            if (response_file) {
-                fclose(response_file);
-                response_file = NULL;
-            }
+            stream_complete = true;
+            started_playback = false;
             memset(emotion_buffer, 0, sizeof(emotion_buffer));
             break;
             
@@ -599,6 +668,73 @@ esp_err_t http_event_handler(esp_http_client_event_t *evt) {
             break;
     }
     return ESP_OK;
+}
+
+// New streaming playback function
+void play_audio_stream(void) {
+    ESP_LOGI(TAG, "🔊 Playing streaming audio...");
+    is_playing = true;
+    interrupt_playback = false;  // Reset interrupt flag
+    
+    #define PLAY_CHUNK_SIZE 1024
+    int16_t *mono_buffer = (int16_t *)malloc(PLAY_CHUNK_SIZE);
+    int16_t *stereo_buffer = (int16_t *)malloc(PLAY_CHUNK_SIZE * 2);
+    
+    if (!mono_buffer || !stereo_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate playback buffers");
+        if (mono_buffer) free(mono_buffer);
+        if (stereo_buffer) free(stereo_buffer);
+        is_playing = false;
+        return;
+    }
+    
+    i2s_zero_dma_buffer(I2S_NUM_SPK);
+    size_t bytes_written;
+    
+    // Play until stream is complete and buffer is empty, or interrupted
+    while ((!stream_complete || get_buffered_data_size() > 0) && !interrupt_playback) {
+        size_t bytes_read = stream_buffer_read((uint8_t*)mono_buffer, PLAY_CHUNK_SIZE);
+        
+        if (bytes_read > 0) {
+            int samples = bytes_read / sizeof(int16_t);
+            
+            // Convert mono to stereo
+            for (int i = 0; i < samples; i++) {
+                stereo_buffer[i * 2] = mono_buffer[i];
+                stereo_buffer[i * 2 + 1] = mono_buffer[i];
+            }
+            
+            size_t stereo_bytes = samples * 2 * sizeof(int16_t);
+            i2s_write(I2S_NUM_SPK, stereo_buffer, stereo_bytes, &bytes_written, portMAX_DELAY);
+        } else {
+            // Buffer empty, wait for more data
+            if (!stream_complete && !interrupt_playback) {
+                vTaskDelay(10 / portTICK_PERIOD_MS);
+            } else {
+                break;  // Stream done and buffer empty, or interrupted
+            }
+        }
+        
+        // Check for interruption more frequently
+        if (interrupt_playback) {
+            ESP_LOGI(TAG, "⏸️ Playback interrupted by wake word!");
+            break;
+        }
+    }
+    
+    // Clear I2S buffer to stop audio immediately
+    i2s_zero_dma_buffer(I2S_NUM_SPK);
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    
+    free(mono_buffer);
+    free(stereo_buffer);
+    is_playing = false;
+    
+    if (interrupt_playback) {
+        ESP_LOGI(TAG, "✅ Playback stopped - ready for new command");
+    } else {
+        ESP_LOGI(TAG, "✅ Streaming playback finished");
+    }
 }
 
 // ======================== Send Audio to Server ========================
@@ -611,7 +747,9 @@ void send_audio_to_server(void *arg) {
     esp_http_client_config_t config = {
         .url = SERVER_URL,
         .method = HTTP_METHOD_POST,
-        .timeout_ms = 10000,
+        .timeout_ms = 60000,        // Increase to 60 seconds
+        .buffer_size = 4096,        // Larger buffer for faster transfer
+        .buffer_size_tx = 4096,     // Larger TX buffer
         .event_handler = http_event_handler,
     };
     
@@ -625,13 +763,21 @@ void send_audio_to_server(void *arg) {
     
     if (err == ESP_OK) {
         int status = esp_http_client_get_status_code(client);
-        ESP_LOGI(TAG, "✅ Audio sent! Status: %d, Size: %d bytes", status, audio_size);
+        int content_length = esp_http_client_get_content_length(client);
+        ESP_LOGI(TAG, "✅ Audio sent! Status: %d, Response size: %d bytes", status, content_length);
         set_led_color(0, RGB_BRIGHTNESS, 0);
         vTaskDelay(500 / portTICK_PERIOD_MS);
     } else {
         ESP_LOGE(TAG, "❌ Failed to send audio: %s", esp_err_to_name(err));
+        
+        // Show specific error info
+        if (err == ESP_ERR_HTTP_FETCH_HEADER) {
+            ESP_LOGE(TAG, "   → Server didn't respond with valid headers");
+            ESP_LOGE(TAG, "   → Check if server is running and responsive");
+        }
+        
         set_led_color(RGB_BRIGHTNESS, 0, 0);
-        vTaskDelay(500 / portTICK_PERIOD_MS);
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
     
     set_led_color(0, 0, 0);
@@ -681,6 +827,9 @@ void recording_task(void *arg) {
     
     is_recording = false;
     set_led_color(0, 0, 0);
+    
+    // Clear interrupt flag after recording is done
+    interrupt_playback = false;
     
     ESP_LOGI(TAG, "⏹️ Recording stopped! Samples: %d (%.2f seconds)", 
              recording_samples, (float)recording_samples / SAMPLE_RATE);
@@ -767,6 +916,12 @@ void feed_task(void *arg) {
     ESP_LOGI(TAG, "✓ Feed task started");
 
     while (task_flag) {
+        // Only pause feeding during recording, not during playback
+        if (is_recording || interrupt_playback) {
+            vTaskDelay(50 / portTICK_PERIOD_MS);
+            continue;
+        }
+        
         int ret = custom_get_feed_data(false, i2s_buff, audio_chunksize * sizeof(int16_t) * feed_channel);
         
         if (ret > 0) {
@@ -793,6 +948,12 @@ void detect_task(void *arg) {
     ESP_LOGI(TAG, "========================================");
     
     while (task_flag) {
+        // Only pause detection during recording
+        if (is_recording || interrupt_playback) {
+            vTaskDelay(50 / portTICK_PERIOD_MS);
+            continue;
+        }
+        
         afe_fetch_result_t* res = afe_handle->fetch(afe_data); 
         
         if (!res || res->ret_value == ESP_FAIL) {
@@ -806,8 +967,38 @@ void detect_task(void *arg) {
             ESP_LOGI(TAG, "  ✅ WAKE WORD DETECTED!");
             ESP_LOGI(TAG, "========================================");
             
-            wakeup_animation();
+            // If currently playing, interrupt it
+            if (is_playing) {
+                ESP_LOGI(TAG, "⏸️ Interrupting current playback...");
+                interrupt_playback = true;
+                
+                // Quick visual feedback instead of full animation
+                set_led_color(0, RGB_BRIGHTNESS, RGB_BRIGHTNESS);  // Cyan for interrupt
+                
+                // Wait for playback to stop
+                int timeout = 0;
+                while (is_playing && timeout < 100) {
+                    vTaskDelay(10 / portTICK_PERIOD_MS);
+                    timeout++;
+                }
+                
+                set_led_color(0, 0, 0);
+                
+                // Quick eye blink instead of full animation (non-blocking)
+                left_eye.height = 2;
+                right_eye.height = 2;
+                draw_frame();
+                vTaskDelay(50 / portTICK_PERIOD_MS);
+                left_eye.height = REF_EYE_HEIGHT;
+                right_eye.height = REF_EYE_HEIGHT;
+                draw_frame();
+                
+            } else {
+                // Full animation when not interrupting
+                wakeup_animation();
+            }
             
+            // Wait for any pending operations
             while (send_audio_flag) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
             }
@@ -836,8 +1027,16 @@ void play_mp3_file(const char *filename) {
     ESP_LOGI(TAG, "🔊 Playing audio...");
     is_playing = true;
     
-    uint8_t *buffer = (uint8_t *)malloc(PLAYBACK_BUFFER_SIZE);
-    if (!buffer) {
+    // Allocate buffer for mono PCM input
+    #define PLAY_CHUNK_SIZE 2048
+    int16_t *mono_buffer = (int16_t *)malloc(PLAY_CHUNK_SIZE);
+    // Allocate buffer for stereo output (double size)
+    int16_t *stereo_buffer = (int16_t *)malloc(PLAY_CHUNK_SIZE * 2);
+    
+    if (!mono_buffer || !stereo_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate playback buffers");
+        if (mono_buffer) free(mono_buffer);
+        if (stereo_buffer) free(stereo_buffer);
         fclose(fp);
         return;
     }
@@ -845,11 +1044,31 @@ void play_mp3_file(const char *filename) {
     size_t bytes_read;
     size_t bytes_written;
     
-    while ((bytes_read = fread(buffer, 1, PLAYBACK_BUFFER_SIZE, fp)) > 0) {
-        i2s_write(I2S_NUM_SPK, buffer, bytes_read, &bytes_written, portMAX_DELAY);
+    // Clear I2S DMA buffer before starting
+    i2s_zero_dma_buffer(I2S_NUM_SPK);
+    
+    while ((bytes_read = fread(mono_buffer, 1, PLAY_CHUNK_SIZE, fp)) > 0) {
+        int samples = bytes_read / sizeof(int16_t);
+        
+        // Convert mono to stereo by duplicating samples
+        for (int i = 0; i < samples; i++) {
+            stereo_buffer[i * 2] = mono_buffer[i];     // Left channel
+            stereo_buffer[i * 2 + 1] = mono_buffer[i]; // Right channel
+        }
+        
+        // Write stereo data to I2S
+        size_t stereo_bytes = samples * 2 * sizeof(int16_t);
+        i2s_write(I2S_NUM_SPK, stereo_buffer, stereo_bytes, &bytes_written, portMAX_DELAY);
+        
+        // Small delay to prevent buffer overrun
+        vTaskDelay(1);
     }
     
-    free(buffer);
+    // Wait for DMA to finish
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    
+    free(mono_buffer);
+    free(stereo_buffer);
     fclose(fp);
     is_playing = false;
     
@@ -857,6 +1076,7 @@ void play_mp3_file(const char *filename) {
 }
 
 // ======================== Audio Playback Task ========================
+// Modified audio playback task
 void audio_playback_task(void *arg) {
     ESP_LOGI(TAG, "✓ Audio playback task started");
     
@@ -868,21 +1088,30 @@ void audio_playback_task(void *arg) {
             ESP_LOGI(TAG, "║      🔊 PLAYING RESPONSE                ║");
             ESP_LOGI(TAG, "╚══════════════════════════════════════════╝");
             
-            // Process emotion before playing
+            // Process emotion
             if (has_new_emotion) {
                 process_emotion(pending_emotion);
                 has_new_emotion = false;
                 memset(pending_emotion, 0, sizeof(pending_emotion));
             }
             
-            // Play audio
-            play_mp3_file("/spiffs/response.mp3");
+            // Play streaming audio (can be interrupted)
+            play_audio_stream();
             
-            // Clean up
-            remove("/spiffs/response.mp3");
+            // Clean up stream state
+            stream_complete = false;
+            buffer_write_pos = 0;
+            buffer_read_pos = 0;
+            buffer_data_size = 0;
+            interrupt_playback = false;
             
-            // Return to idle animation
-            reset_eyes(true);
+            // Short delay before ready for next command
+            vTaskDelay(200 / portTICK_PERIOD_MS);
+            
+            // Return to idle animation only if not interrupted
+            if (!is_recording) {
+                reset_eyes(true);
+            }
         }
         
         vTaskDelay(100 / portTICK_PERIOD_MS);
@@ -890,6 +1119,7 @@ void audio_playback_task(void *arg) {
     
     vTaskDelete(NULL);
 }
+
 
 // ======================== Wake Word Initialization ========================
 bool init_wake_word_detection(void) {
@@ -951,7 +1181,7 @@ bool init_wake_word_detection(void) {
 void app_main(void) {
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  Voice Assistant - ESP32-S3-N16R8");
-    ESP_LOGI(TAG, "  FIXED VERSION");
+    ESP_LOGI(TAG, "  STREAMING VERSION");
     ESP_LOGI(TAG, "========================================");
     
     // Initialize RGB LED
@@ -962,10 +1192,10 @@ void app_main(void) {
     display_init();
     sleep_eyes();
     
-    // Initialize SPIFFS (FIXED)
+    // Initialize SPIFFS (for model storage, not audio)
     esp_err_t spiffs_ret = spiffs_init();
     if (spiffs_ret != ESP_OK) {
-        ESP_LOGE(TAG, "❌ SPIFFS initialization failed - audio recording disabled");
+        ESP_LOGE(TAG, "⚠️ SPIFFS initialization failed");
     }
     
     // Allocate recording buffer in PSRAM
@@ -975,6 +1205,31 @@ void app_main(void) {
         return;
     }
     ESP_LOGI(TAG, "✓ Recording buffer allocated: %d bytes", RECORDING_BUFFER_SIZE);
+    
+    // Initialize streaming buffer in PSRAM for better performance
+    stream_buffer = (uint8_t *)heap_caps_malloc(STREAM_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+    if (stream_buffer == NULL) {
+        ESP_LOGE(TAG, "❌ Failed to allocate stream buffer!");
+        free(recording_buffer);
+        return;
+    }
+    ESP_LOGI(TAG, "✓ Stream buffer allocated: %d bytes", STREAM_BUFFER_SIZE);
+    
+    // Create buffer mutex for thread-safe access
+    buffer_mutex = xSemaphoreCreateMutex();
+    if (buffer_mutex == NULL) {
+        ESP_LOGE(TAG, "❌ Failed to create buffer mutex!");
+        free(recording_buffer);
+        free(stream_buffer);
+        return;
+    }
+    ESP_LOGI(TAG, "✓ Buffer mutex created");
+    
+    // Initialize stream state
+    buffer_write_pos = 0;
+    buffer_read_pos = 0;
+    buffer_data_size = 0;
+    stream_complete = false;
     
     // Initialize WiFi
     wifi_init();
@@ -1006,10 +1261,11 @@ void app_main(void) {
         xTaskCreatePinnedToCore(&button_monitor_task, "button", 4 * 1024, NULL, 5, NULL, 1);
     }
     
-    // Start audio playback task
+    // Start audio playback task (handles streaming playback)
     xTaskCreatePinnedToCore(&audio_playback_task, "playback", 8 * 1024, NULL, 4, NULL, 1);
     
     ESP_LOGI(TAG, "✓ System ready!");
+    ESP_LOGI(TAG, "🎵 Streaming mode enabled - instant playback!");
     
     // Wake up animation
     vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -1022,6 +1278,13 @@ void app_main(void) {
         set_led_color(0, 0, 0);
         vTaskDelay(200 / portTICK_PERIOD_MS);
     }
+    
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔══════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║  ✅ READY FOR VOICE COMMANDS            ║");
+    ESP_LOGI(TAG, "║  🎯 Streaming: ~0.5s response latency   ║");
+    ESP_LOGI(TAG, "╚══════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "");
     
     // Main loop
     while(1) {

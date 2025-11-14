@@ -107,7 +107,7 @@ esp_err_t bsp_get_feed_data(bool is_get_raw_channel, int16_t *buffer, int buffer
     ret = i2s_read(I2S_NUM_1, buffer, buffer_len, &bytes_read, portMAX_DELAY);
 #endif
 
-    int32_t *tmp_buff = buffer;
+    int16_t *tmp_buff = buffer;
     for (int i = 0; i < audio_chunksize; i++) {
         tmp_buff[i] = tmp_buff[i] >> 14; // 32:8为有效位， 8:0为低8位， 全为0， AFE的输入为16位语音数据，拿29：13位是为了对语音信号放大。
     }
