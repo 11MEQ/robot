@@ -127,6 +127,8 @@ static bool use_wake_word = false;  // Will be set based on model availability
 static volatile bool pause_wake_word = false;
 // Add this with other volatile flags
 static volatile bool interrupt_playback = false;
+static volatile bool pause_feed_task = false;  // ADD THIS LINE
+
 
 static uint8_t *stream_buffer = NULL;
 static volatile size_t buffer_write_pos = 0;
@@ -905,19 +907,23 @@ void button_monitor_task(void *arg) {
     vTaskDelete(NULL);
 }
 
-// ======================== Wake Word Tasks (Optional) ========================
+// 3. MODIFY feed_task - Add rate limiting to prevent overflow
 void feed_task(void *arg) {
     esp_afe_sr_data_t *afe_data = (esp_afe_sr_data_t *)arg;
     int audio_chunksize = afe_handle->get_feed_chunksize(afe_data);
     int feed_channel = 1;
     int16_t *i2s_buff = (int16_t *)malloc(audio_chunksize * sizeof(int16_t) * feed_channel);
     assert(i2s_buff);
+    
+    int consecutive_errors = 0;
+    const int MAX_CONSECUTIVE_ERRORS = 5;
 
     ESP_LOGI(TAG, "✓ Feed task started");
 
     while (task_flag) {
-        // Only pause feeding during recording, not during playback
-        if (is_recording || interrupt_playback) {
+        // Pause feeding during recording, interrupt, OR explicit pause
+        if (is_recording || interrupt_playback || pause_feed_task) {
+            consecutive_errors = 0;  // Reset error count
             vTaskDelay(50 / portTICK_PERIOD_MS);
             continue;
         }
@@ -925,7 +931,23 @@ void feed_task(void *arg) {
         int ret = custom_get_feed_data(false, i2s_buff, audio_chunksize * sizeof(int16_t) * feed_channel);
         
         if (ret > 0) {
-            afe_handle->feed(afe_data, i2s_buff);
+            int feed_result = afe_handle->feed(afe_data, i2s_buff);
+            
+            if (feed_result == ESP_FAIL) {
+                consecutive_errors++;
+                
+                if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
+                    ESP_LOGW(TAG, "⚠️ Multiple AFE buffer overflows, flushing...");
+                    flush_afe_buffer(afe_data);
+                    consecutive_errors = 0;
+                    vTaskDelay(50 / portTICK_PERIOD_MS);
+                } else {
+                    vTaskDelay((10 * consecutive_errors) / portTICK_PERIOD_MS);
+                }
+            } else {
+                consecutive_errors = 0;
+                vTaskDelay(10 / portTICK_PERIOD_MS);
+            }
         } else {
             vTaskDelay(10 / portTICK_PERIOD_MS);
         }
@@ -937,6 +959,23 @@ void feed_task(void *arg) {
     vTaskDelete(NULL);
 }
 
+
+// 1. ADD BUFFER FLUSH FUNCTION (Add this after the feed_task function)
+void flush_afe_buffer(esp_afe_sr_data_t *afe_data) {
+    if (afe_handle && afe_data) {
+        // Fetch and discard all pending data to clear the buffer
+        for (int i = 0; i < 10; i++) {
+            afe_fetch_result_t* res = afe_handle->fetch(afe_data);
+            if (!res) break;
+            vTaskDelay(5 / portTICK_PERIOD_MS);
+        }
+        ESP_LOGI(TAG, "✓ AFE buffer flushed");
+    }
+}
+
+
+
+// 2. MODIFY detect_task - Add buffer flush after interrupt
 void detect_task(void *arg) {
     esp_afe_sr_data_t *afe_data = (esp_afe_sr_data_t *)arg;
     
@@ -970,21 +1009,36 @@ void detect_task(void *arg) {
             // If currently playing, interrupt it
             if (is_playing) {
                 ESP_LOGI(TAG, "⏸️ Interrupting current playback...");
+                
+                // CRITICAL: Stop feed task IMMEDIATELY
+                pause_feed_task = true;
                 interrupt_playback = true;
                 
-                // Quick visual feedback instead of full animation
-                set_led_color(0, RGB_BRIGHTNESS, RGB_BRIGHTNESS);  // Cyan for interrupt
+                // Quick visual feedback
+                set_led_color(0, RGB_BRIGHTNESS, RGB_BRIGHTNESS);
                 
-                // Wait for playback to stop
+                // Wait for playback to stop with timeout
                 int timeout = 0;
                 while (is_playing && timeout < 100) {
                     vTaskDelay(10 / portTICK_PERIOD_MS);
                     timeout++;
                 }
                 
+                // Flush AFE buffer
+                ESP_LOGI(TAG, "🔄 Flushing AFE buffer...");
+                flush_afe_buffer(afe_data);
+                
+                // CRITICAL: Keep feed paused for 500ms to let buffer fully clear
+                ESP_LOGI(TAG, "⏸️ Keeping feed paused for stabilization...");
+                vTaskDelay(500 / portTICK_PERIOD_MS);
+                
+                // Now safe to resume feeding
+                pause_feed_task = false;
+                ESP_LOGI(TAG, "▶️ Feed task resumed");
+                
                 set_led_color(0, 0, 0);
                 
-                // Quick eye blink instead of full animation (non-blocking)
+                // Quick eye blink
                 left_eye.height = 2;
                 right_eye.height = 2;
                 draw_frame();
@@ -1015,6 +1069,7 @@ void detect_task(void *arg) {
     
     vTaskDelete(NULL);
 }
+
 
 // ======================== Simple MP3 Playback ========================
 void play_mp3_file(const char *filename) {
@@ -1122,6 +1177,7 @@ void audio_playback_task(void *arg) {
 
 
 // ======================== Wake Word Initialization ========================
+// 4. ALTERNATIVE: Increase AFE buffer size in init_wake_word_detection()
 bool init_wake_word_detection(void) {
     ESP_LOGI(TAG, "Attempting to initialize wake word detection...");
     
@@ -1131,35 +1187,30 @@ bool init_wake_word_detection(void) {
     
     if (models == NULL) {
         ESP_LOGW(TAG, "⚠️ Wake word models not found");
-        ESP_LOGW(TAG, "Possible causes:");
-        ESP_LOGW(TAG, "1. Model partition not flashed with wake word data");
-        ESP_LOGW(TAG, "2. Partition table not configured correctly");
-        ESP_LOGW(TAG, "3. Model files missing or corrupted");
-        ESP_LOGW(TAG, "");
         ESP_LOGW(TAG, "→ Falling back to button-triggered recording");
         return false;
     }
     
     ESP_LOGI(TAG, "✓ Speech models loaded successfully");
-    ESP_LOGI(TAG, "Available models: %d", models->num);
-    for (int i = 0; i < models->num; i++) {
-        ESP_LOGI(TAG, "  [%d] %s", i, models->model_name[i]);
-    }
     
-    // Initialize AFE for wake word detection
+    // Initialize AFE
     afe_handle = (esp_afe_sr_iface_t *)&ESP_AFE_SR_HANDLE;
     afe_config_t afe_config = AFE_CONFIG_DEFAULT();
     afe_config.wakenet_model_name = esp_srmodel_filter(models, ESP_WN_PREFIX, NULL);
     
     if (afe_config.wakenet_model_name == NULL) {
-        ESP_LOGW(TAG, "⚠️ No wake-net model found in loaded models");
+        ESP_LOGW(TAG, "⚠️ No wake-net model found");
         return false;
     }
     
+    // === KEY FIX: Increase buffer sizes ===
     afe_config.aec_init = false;
     afe_config.pcm_config.total_ch_num = 1;
     afe_config.pcm_config.mic_num = 1;
     afe_config.pcm_config.ref_num = 0;
+    
+    // Increase internal buffer sizes to prevent overflow
+    afe_config.afe_ringbuf_size = 100;  // Increase from default (usually 50)
     
     ESP_LOGI(TAG, "Wake word model: %s", afe_config.wakenet_model_name);
     
@@ -1169,9 +1220,10 @@ bool init_wake_word_detection(void) {
         return false;
     }
     
-    // Create wake word detection tasks
+    // Create tasks with proper priority
+    // Lower priority for feed to prevent overwhelming the buffer
     xTaskCreatePinnedToCore(&detect_task, "detect", 8 * 1024, (void*)afe_data, 5, NULL, 1);
-    xTaskCreatePinnedToCore(&feed_task, "feed", 8 * 1024, (void*)afe_data, 5, NULL, 0);
+    xTaskCreatePinnedToCore(&feed_task, "feed", 8 * 1024, (void*)afe_data, 4, NULL, 0);  // Lower priority
     
     ESP_LOGI(TAG, "✅ Wake word detection initialized!");
     return true;
