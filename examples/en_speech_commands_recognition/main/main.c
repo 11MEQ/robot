@@ -974,7 +974,6 @@ void flush_afe_buffer(esp_afe_sr_data_t *afe_data) {
 }
 
 
-
 // 2. MODIFY detect_task - Add buffer flush after interrupt
 void detect_task(void *arg) {
     esp_afe_sr_data_t *afe_data = (esp_afe_sr_data_t *)arg;
