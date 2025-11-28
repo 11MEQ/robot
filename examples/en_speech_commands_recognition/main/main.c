@@ -125,9 +125,6 @@ static srmodel_list_t *models = NULL;
 static bool use_wake_word = false;  // Will be set based on model availability
 
 static volatile bool pause_wake_word = false;
-// Add this with other volatile flags
-static volatile bool interrupt_playback = false;
-static volatile bool pause_feed_task = false;  // ADD THIS LINE
 
 
 static uint8_t *stream_buffer = NULL;
@@ -676,7 +673,7 @@ esp_err_t http_event_handler(esp_http_client_event_t *evt) {
 void play_audio_stream(void) {
     ESP_LOGI(TAG, "🔊 Playing streaming audio...");
     is_playing = true;
-    interrupt_playback = false;  // Reset interrupt flag
+    pause_wake_word = true;
     
     #define PLAY_CHUNK_SIZE 1024
     int16_t *mono_buffer = (int16_t *)malloc(PLAY_CHUNK_SIZE);
@@ -687,14 +684,15 @@ void play_audio_stream(void) {
         if (mono_buffer) free(mono_buffer);
         if (stereo_buffer) free(stereo_buffer);
         is_playing = false;
+        pause_wake_word = false;
         return;
     }
     
     i2s_zero_dma_buffer(I2S_NUM_SPK);
     size_t bytes_written;
     
-    // Play until stream is complete and buffer is empty, or interrupted
-    while ((!stream_complete || get_buffered_data_size() > 0) && !interrupt_playback) {
+    // Play until stream is complete and buffer is empty
+    while (!stream_complete || get_buffered_data_size() > 0) {
         size_t bytes_read = stream_buffer_read((uint8_t*)mono_buffer, PLAY_CHUNK_SIZE);
         
         if (bytes_read > 0) {
@@ -710,33 +708,21 @@ void play_audio_stream(void) {
             i2s_write(I2S_NUM_SPK, stereo_buffer, stereo_bytes, &bytes_written, portMAX_DELAY);
         } else {
             // Buffer empty, wait for more data
-            if (!stream_complete && !interrupt_playback) {
+            if (!stream_complete) {
                 vTaskDelay(10 / portTICK_PERIOD_MS);
             } else {
-                break;  // Stream done and buffer empty, or interrupted
+                break;  // Stream done and buffer empty
             }
-        }
-        
-        // Check for interruption more frequently
-        if (interrupt_playback) {
-            ESP_LOGI(TAG, "⏸️ Playback interrupted by wake word!");
-            break;
         }
     }
     
-    // Clear I2S buffer to stop audio immediately
-    i2s_zero_dma_buffer(I2S_NUM_SPK);
-    vTaskDelay(50 / portTICK_PERIOD_MS);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
     
     free(mono_buffer);
     free(stereo_buffer);
     is_playing = false;
     
-    if (interrupt_playback) {
-        ESP_LOGI(TAG, "✅ Playback stopped - ready for new command");
-    } else {
-        ESP_LOGI(TAG, "✅ Streaming playback finished");
-    }
+    ESP_LOGI(TAG, "✅ Streaming playback finished");
 }
 
 // ======================== Send Audio to Server ========================
@@ -830,9 +816,6 @@ void recording_task(void *arg) {
     is_recording = false;
     set_led_color(0, 0, 0);
     
-    // Clear interrupt flag after recording is done
-    interrupt_playback = false;
-    
     ESP_LOGI(TAG, "⏹️ Recording stopped! Samples: %d (%.2f seconds)", 
              recording_samples, (float)recording_samples / SAMPLE_RATE);
     
@@ -907,23 +890,19 @@ void button_monitor_task(void *arg) {
     vTaskDelete(NULL);
 }
 
-// 3. MODIFY feed_task - Add rate limiting to prevent overflow
+// ======================== Wake Word Tasks (Optional) ========================
 void feed_task(void *arg) {
     esp_afe_sr_data_t *afe_data = (esp_afe_sr_data_t *)arg;
     int audio_chunksize = afe_handle->get_feed_chunksize(afe_data);
     int feed_channel = 1;
     int16_t *i2s_buff = (int16_t *)malloc(audio_chunksize * sizeof(int16_t) * feed_channel);
     assert(i2s_buff);
-    
-    int consecutive_errors = 0;
-    const int MAX_CONSECUTIVE_ERRORS = 5;
 
     ESP_LOGI(TAG, "✓ Feed task started");
 
     while (task_flag) {
-        // Pause feeding during recording, interrupt, OR explicit pause
-        if (is_recording || interrupt_playback || pause_feed_task) {
-            consecutive_errors = 0;  // Reset error count
+        // Skip feeding if audio is playing
+        if (pause_wake_word || is_playing) {
             vTaskDelay(50 / portTICK_PERIOD_MS);
             continue;
         }
@@ -931,23 +910,7 @@ void feed_task(void *arg) {
         int ret = custom_get_feed_data(false, i2s_buff, audio_chunksize * sizeof(int16_t) * feed_channel);
         
         if (ret > 0) {
-            int feed_result = afe_handle->feed(afe_data, i2s_buff);
-            
-            if (feed_result == ESP_FAIL) {
-                consecutive_errors++;
-                
-                if (consecutive_errors >= MAX_CONSECUTIVE_ERRORS) {
-                    ESP_LOGW(TAG, "⚠️ Multiple AFE buffer overflows, flushing...");
-                    flush_afe_buffer(afe_data);
-                    consecutive_errors = 0;
-                    vTaskDelay(50 / portTICK_PERIOD_MS);
-                } else {
-                    vTaskDelay((10 * consecutive_errors) / portTICK_PERIOD_MS);
-                }
-            } else {
-                consecutive_errors = 0;
-                vTaskDelay(10 / portTICK_PERIOD_MS);
-            }
+            afe_handle->feed(afe_data, i2s_buff);
         } else {
             vTaskDelay(10 / portTICK_PERIOD_MS);
         }
@@ -959,22 +922,6 @@ void feed_task(void *arg) {
     vTaskDelete(NULL);
 }
 
-
-// 1. ADD BUFFER FLUSH FUNCTION (Add this after the feed_task function)
-void flush_afe_buffer(esp_afe_sr_data_t *afe_data) {
-    if (afe_handle && afe_data) {
-        // Fetch and discard all pending data to clear the buffer
-        for (int i = 0; i < 10; i++) {
-            afe_fetch_result_t* res = afe_handle->fetch(afe_data);
-            if (!res) break;
-            vTaskDelay(5 / portTICK_PERIOD_MS);
-        }
-        ESP_LOGI(TAG, "✓ AFE buffer flushed");
-    }
-}
-
-
-// 2. MODIFY detect_task - Add buffer flush after interrupt
 void detect_task(void *arg) {
     esp_afe_sr_data_t *afe_data = (esp_afe_sr_data_t *)arg;
     
@@ -986,8 +933,8 @@ void detect_task(void *arg) {
     ESP_LOGI(TAG, "========================================");
     
     while (task_flag) {
-        // Only pause detection during recording
-        if (is_recording || interrupt_playback) {
+        // Skip detection if audio is playing
+        if (pause_wake_word || is_playing) {
             vTaskDelay(50 / portTICK_PERIOD_MS);
             continue;
         }
@@ -1005,54 +952,9 @@ void detect_task(void *arg) {
             ESP_LOGI(TAG, "  ✅ WAKE WORD DETECTED!");
             ESP_LOGI(TAG, "========================================");
             
-            // If currently playing, interrupt it
-            if (is_playing) {
-                ESP_LOGI(TAG, "⏸️ Interrupting current playback...");
-                
-                // CRITICAL: Stop feed task IMMEDIATELY
-                pause_feed_task = true;
-                interrupt_playback = true;
-                
-                // Quick visual feedback
-                set_led_color(0, RGB_BRIGHTNESS, RGB_BRIGHTNESS);
-                
-                // Wait for playback to stop with timeout
-                int timeout = 0;
-                while (is_playing && timeout < 100) {
-                    vTaskDelay(10 / portTICK_PERIOD_MS);
-                    timeout++;
-                }
-                
-                // Flush AFE buffer
-                ESP_LOGI(TAG, "🔄 Flushing AFE buffer...");
-                flush_afe_buffer(afe_data);
-                
-                // CRITICAL: Keep feed paused for 500ms to let buffer fully clear
-                ESP_LOGI(TAG, "⏸️ Keeping feed paused for stabilization...");
-                vTaskDelay(500 / portTICK_PERIOD_MS);
-                
-                // Now safe to resume feeding
-                pause_feed_task = false;
-                ESP_LOGI(TAG, "▶️ Feed task resumed");
-                
-                set_led_color(0, 0, 0);
-                
-                // Quick eye blink
-                left_eye.height = 2;
-                right_eye.height = 2;
-                draw_frame();
-                vTaskDelay(50 / portTICK_PERIOD_MS);
-                left_eye.height = REF_EYE_HEIGHT;
-                right_eye.height = REF_EYE_HEIGHT;
-                draw_frame();
-                
-            } else {
-                // Full animation when not interrupting
-                wakeup_animation();
-            }
+            wakeup_animation();
             
-            // Wait for any pending operations
-            while (send_audio_flag) {
+            while (send_audio_flag || is_playing) {
                 vTaskDelay(100 / portTICK_PERIOD_MS);
             }
             
@@ -1068,7 +970,6 @@ void detect_task(void *arg) {
     
     vTaskDelete(NULL);
 }
-
 
 // ======================== Simple MP3 Playback ========================
 void play_mp3_file(const char *filename) {
@@ -1149,23 +1050,21 @@ void audio_playback_task(void *arg) {
                 memset(pending_emotion, 0, sizeof(pending_emotion));
             }
             
-            // Play streaming audio (can be interrupted)
+            // Play streaming audio
             play_audio_stream();
             
-            // Clean up stream state
+            // Resume wake word detection
+            vTaskDelay(200 / portTICK_PERIOD_MS);
+            pause_wake_word = false;
+            
+            // Reset stream state
             stream_complete = false;
             buffer_write_pos = 0;
             buffer_read_pos = 0;
             buffer_data_size = 0;
-            interrupt_playback = false;
             
-            // Short delay before ready for next command
-            vTaskDelay(200 / portTICK_PERIOD_MS);
-            
-            // Return to idle animation only if not interrupted
-            if (!is_recording) {
-                reset_eyes(true);
-            }
+            // Return to idle animation
+            reset_eyes(true);
         }
         
         vTaskDelay(100 / portTICK_PERIOD_MS);
@@ -1174,9 +1073,7 @@ void audio_playback_task(void *arg) {
     vTaskDelete(NULL);
 }
 
-
 // ======================== Wake Word Initialization ========================
-// 4. ALTERNATIVE: Increase AFE buffer size in init_wake_word_detection()
 bool init_wake_word_detection(void) {
     ESP_LOGI(TAG, "Attempting to initialize wake word detection...");
     
@@ -1186,30 +1083,35 @@ bool init_wake_word_detection(void) {
     
     if (models == NULL) {
         ESP_LOGW(TAG, "⚠️ Wake word models not found");
+        ESP_LOGW(TAG, "Possible causes:");
+        ESP_LOGW(TAG, "1. Model partition not flashed with wake word data");
+        ESP_LOGW(TAG, "2. Partition table not configured correctly");
+        ESP_LOGW(TAG, "3. Model files missing or corrupted");
+        ESP_LOGW(TAG, "");
         ESP_LOGW(TAG, "→ Falling back to button-triggered recording");
         return false;
     }
     
     ESP_LOGI(TAG, "✓ Speech models loaded successfully");
+    ESP_LOGI(TAG, "Available models: %d", models->num);
+    for (int i = 0; i < models->num; i++) {
+        ESP_LOGI(TAG, "  [%d] %s", i, models->model_name[i]);
+    }
     
-    // Initialize AFE
+    // Initialize AFE for wake word detection
     afe_handle = (esp_afe_sr_iface_t *)&ESP_AFE_SR_HANDLE;
     afe_config_t afe_config = AFE_CONFIG_DEFAULT();
     afe_config.wakenet_model_name = esp_srmodel_filter(models, ESP_WN_PREFIX, NULL);
     
     if (afe_config.wakenet_model_name == NULL) {
-        ESP_LOGW(TAG, "⚠️ No wake-net model found");
+        ESP_LOGW(TAG, "⚠️ No wake-net model found in loaded models");
         return false;
     }
     
-    // === KEY FIX: Increase buffer sizes ===
     afe_config.aec_init = false;
     afe_config.pcm_config.total_ch_num = 1;
     afe_config.pcm_config.mic_num = 1;
     afe_config.pcm_config.ref_num = 0;
-    
-    // Increase internal buffer sizes to prevent overflow
-    afe_config.afe_ringbuf_size = 100;  // Increase from default (usually 50)
     
     ESP_LOGI(TAG, "Wake word model: %s", afe_config.wakenet_model_name);
     
@@ -1219,10 +1121,9 @@ bool init_wake_word_detection(void) {
         return false;
     }
     
-    // Create tasks with proper priority
-    // Lower priority for feed to prevent overwhelming the buffer
+    // Create wake word detection tasks
     xTaskCreatePinnedToCore(&detect_task, "detect", 8 * 1024, (void*)afe_data, 5, NULL, 1);
-    xTaskCreatePinnedToCore(&feed_task, "feed", 8 * 1024, (void*)afe_data, 4, NULL, 0);  // Lower priority
+    xTaskCreatePinnedToCore(&feed_task, "feed", 8 * 1024, (void*)afe_data, 5, NULL, 0);
     
     ESP_LOGI(TAG, "✅ Wake word detection initialized!");
     return true;
