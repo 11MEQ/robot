@@ -16,6 +16,9 @@ set(requires
     freertos            # FreeRTOS
     spiffs              # File system
     u8g2-master         # Display library
+    esp_websocket_client
+    esp_timer
+    json 
     )
 
 idf_component_register(SRCS ${srcs}
